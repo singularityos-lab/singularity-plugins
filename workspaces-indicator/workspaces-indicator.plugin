@@ -1,0 +1,9 @@
+[Plugin]
+Module=workspaces-indicator
+Name=Workspaces Indicator
+Description=Shows workspace dots in the panel for quick navigation
+Authors=Mirko
+Copyright=Copyright © 2025 Mirko
+Website=https://sinty.dev
+Builtin=false
+Hidden=false

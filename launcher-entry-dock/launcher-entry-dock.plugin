@@ -1,0 +1,8 @@
+[Plugin]
+Module=launcher-entry-dock
+Name=Launcher Activity in Dock
+Description=Listens to the Unity LauncherEntry DBus API (com.canonical.Unity.LauncherEntry) and surfaces per-app progress + badge counts in the dock. Out of the box this works for Nautilus, Files, Thunderbird, Steam, Mailspring and any other app that emits the standard signal.
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

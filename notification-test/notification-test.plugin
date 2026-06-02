@@ -1,0 +1,8 @@
+[Plugin]
+Module=notification-test
+Name=Notification Test
+Description=Sends a test notification on startup
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

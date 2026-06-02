@@ -1,0 +1,8 @@
+[Plugin]
+Module=mpris-dock
+Name=Music in Dock
+Description=Replaces the dock icon of any MPRIS-capable player (Spotify, Rhythmbox, etc.) with the album art, and shows prev/play/next controls next to it.
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

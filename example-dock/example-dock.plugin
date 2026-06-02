@@ -1,0 +1,8 @@
+[Plugin]
+Module=example-dock
+Name=Example Dock (replacement)
+Description=Demonstrates the ShellSurfaceProvider API by replacing the built-in dock with a minimal own-surface launcher. Enable to see the shell yield the bottom layer to a plugin.
+Authors=Singularity Team
+Copyright=Copyright © 2026 Singularity Team
+Website=https://sinty.dev
+Builtin=false

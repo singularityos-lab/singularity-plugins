@@ -1,0 +1,8 @@
+[Plugin]
+Module=emoji-search
+Name=Emoji Search
+Description=Adds an "emoji" search provider - type :smile, :fire, :rocket… and pick an emoji to copy to the clipboard.
+Authors=Singularity Team
+Copyright=Copyright © 2026 Singularity Team
+Website=https://sinty.dev
+Builtin=false

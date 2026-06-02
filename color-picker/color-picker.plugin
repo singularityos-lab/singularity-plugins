@@ -1,0 +1,8 @@
+[Plugin]
+Module=color-picker
+Name=Color Picker
+Description=Pick a color from the screen and copy its hex code to the clipboard
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

@@ -1,0 +1,8 @@
+[Plugin]
+Module=downloads-dock
+Name=Downloads in Dock
+Description=Shows active browser downloads (Chrome, Chromium, Brave, Firefox, ...) as bubbles next to the browser icon in the dock.
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

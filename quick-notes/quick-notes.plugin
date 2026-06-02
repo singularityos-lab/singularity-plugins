@@ -1,0 +1,8 @@
+[Plugin]
+Module=quick-notes
+Name=Quick Notes
+Description=Small sticky notes widget in the sidebar that auto-saves
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false

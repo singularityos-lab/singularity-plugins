@@ -1,0 +1,9 @@
+[Plugin]
+Module=clipboard-history
+Name=Clipboard History
+Description=Keeps a history of clipboard entries accessible from the panel
+Authors=Mirko
+Copyright=Copyright © 2025 Mirko
+Website=https://sinty.dev
+Builtin=false
+Hidden=false

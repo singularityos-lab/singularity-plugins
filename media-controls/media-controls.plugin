@@ -1,0 +1,8 @@
+[Plugin]
+Module=media-controls
+Name=Media Controls
+Description=Shows MPRIS2 media player controls (prev, play/pause, next) in the panel
+Authors=Singularity Team
+Copyright=Copyright © 2025 Singularity Team
+Website=https://sinty.dev
+Builtin=false
