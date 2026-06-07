@@ -212,9 +212,8 @@ public class MediaControlsPlugin : Object, Singularity.Plugin {
 
     private void on_props_changed(DBusConnection conn, string? sender, string path,
                                    string iface, string signal_name, Variant params) {
-        Variant dict;
-        params.get("(sa{sv}as)", null, out dict, null);
-        VariantIter iter = dict.iterator();
+        VariantIter iter;
+        params.get("(sa{sv}as)", null, out iter, null);
         string key;
         Variant val;
         bool has_playback = false;
