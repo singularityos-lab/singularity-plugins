@@ -97,6 +97,7 @@ public class ClipboardHistoryPlugin : Object, Singularity.Plugin {
 
     private void on_clipboard_changed() {
         var formats = clipboard.get_formats();
+        if (formats != null && formats.contain_mime_type("x-kde-passwordManagerHint")) return;
         // Prefer an image when the clipboard offers one, otherwise fall back to
         // text. read_text_async returns null for image-only offers, which is
         // why images never showed up before.

@@ -10,6 +10,16 @@ history, media controls, weather, workspaces indicator, docks and more).
 Each plugin builds a shared module installed under
 `lib/singularity/plugins/<name>/`.
 
+## Deprecated plugins
+
+- `clipboard-history` is deprecated. The desktop now keeps the clipboard
+  history itself: press Super+V, or open Settings, Clipboard, to search, pin
+  and paste entries. The plugin is still built and loadable for now, but it is
+  hidden from Settings, Plugins, and the desktop removes it from
+  `enabled-plugins` once, turning on the built-in history for users who had it
+  enabled. The plugin kept its entries in memory only, so there is no stored
+  history or pinned item to carry over. It will be removed in a later release.
+
 ## Requirements
 
 - GTK4, libgee-0.8, libpeas-2

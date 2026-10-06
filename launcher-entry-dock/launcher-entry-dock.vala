@@ -28,40 +28,39 @@ public void peas_register_types(TypeModule module) {
  */
 namespace LauncherEntryDock {
 
-    public class EntryState {
-        public string app_id;          // desktop id without .desktop
-        public int64 count;
-        public bool count_visible;
-        public double progress;        // 0..1
-        public bool progress_visible;
-        public bool urgent;
-        public string? label;           // non-standard, optional pretty name
-        public int64 updated_at;
-    }
-
     public class Extension : Object, Singularity.DockItemExtension {
-        private HashMap<string, EntryState> _by_app = new HashMap<string, EntryState>();
+        private EntryStore _store = new EntryStore();
+        private HashMap<string, EntryState> _by_app;
         private DBusConnection? _conn;
         private uint _sub_id = 0;
+        private uint _owner_sub_id = 0;
+        private uint _save_id = 0;
 
         public Extension() {
+            _by_app = _store.entries;
             try {
                 _conn = Bus.get_sync(BusType.SESSION);
             } catch (Error e) {
                 warning("launcher-entry-dock: bus get failed: %s", e.message);
                 return;
             }
-            // Subscribe to LauncherEntry.Update from anywhere. Object path
-            // varies across emitters (Nautilus uses /com/canonical/Unity/LauncherEntry;
-            // others use their own path), so we pass null for path.
             _sub_id = _conn.signal_subscribe(
-                null,                                       // sender
-                "com.canonical.Unity.LauncherEntry",        // interface
-                "Update",                                    // signal name
-                null,                                       // object path
-                null,                                       // arg0
+                null,
+                "com.canonical.Unity.LauncherEntry",
+                "Update",
+                null,
+                null,
                 DBusSignalFlags.NONE,
                 on_update);
+            _owner_sub_id = _conn.signal_subscribe(
+                "org.freedesktop.DBus",
+                "org.freedesktop.DBus",
+                "NameOwnerChanged",
+                "/org/freedesktop/DBus",
+                null,
+                DBusSignalFlags.NONE,
+                on_name_owner_changed);
+            load_cache();
         }
 
         public void disconnect_dbus() {
@@ -69,84 +68,113 @@ namespace LauncherEntryDock {
                 _conn.signal_unsubscribe(_sub_id);
                 _sub_id = 0;
             }
+            if (_conn != null && _owner_sub_id != 0) {
+                _conn.signal_unsubscribe(_owner_sub_id);
+                _owner_sub_id = 0;
+            }
+            if (_save_id != 0) {
+                Source.remove(_save_id);
+                _save_id = 0;
+                save_cache();
+            }
+        }
+
+        private static string cache_path() {
+            return Path.build_filename(Environment.get_user_cache_dir(), "singularity", "launcher-entries.ini");
+        }
+
+        private void load_cache() {
+            string data;
+            try {
+                if (!FileUtils.get_contents(cache_path(), out data)) return;
+            } catch (Error e) {
+                return;
+            }
+            _store.load_data(data);
+            foreach (var state in _by_app.values) {
+                if (state.app_owned && state.sender != null) check_sender_alive.begin(state.sender);
+            }
+            if (_by_app.size > 0) this.changed("");
+        }
+
+        private async void check_sender_alive(string sender) {
+            if (_conn == null) return;
+            try {
+                var reply = yield _conn.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "NameHasOwner", new Variant("(s)", sender),
+                    new VariantType("(b)"), DBusCallFlags.NONE, 2000, null);
+                if (reply.get_child_value(0).get_boolean()) return;
+            } catch (Error e) {
+            }
+            if (_store.sender_vanished(sender)) {
+                schedule_save();
+                this.changed("");
+            }
+        }
+
+        private void schedule_save() {
+            if (_save_id != 0) return;
+            _save_id = Timeout.add_seconds(1, () => {
+                _save_id = 0;
+                save_cache();
+                return Source.REMOVE;
+            });
+        }
+
+        private void save_cache() {
+            string path = cache_path();
+            try {
+                if (_by_app.size == 0) {
+                    FileUtils.remove(path);
+                    return;
+                }
+                DirUtils.create_with_parents(Path.get_dirname(path), 0700);
+                FileUtils.set_contents(path, _store.to_data());
+            } catch (Error e) {
+                warning("launcher-entry-dock: cannot save %s: %s", path, e.message);
+            }
+        }
+
+        private void on_name_owner_changed(DBusConnection conn, string? sender,
+                                           string object_path, string interface_name,
+                                           string signal_name, Variant parameters) {
+            string name, old_owner, new_owner;
+            parameters.get("(sss)", out name, out old_owner, out new_owner);
+            if (!name.has_prefix(":") || new_owner != "") return;
+            if (_store.sender_vanished(name)) {
+                schedule_save();
+                this.changed("");
+            }
+        }
+
+        private async void resolve_ownership(EntryState state, string sender) {
+            if (_conn == null || state.desktop_id == null) return;
+            string? owner = null;
+            try {
+                var reply = yield _conn.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus", "GetNameOwner", new Variant("(s)", state.desktop_id),
+                    new VariantType("(s)"), DBusCallFlags.NONE, 2000, null);
+                owner = reply.get_child_value(0).get_string();
+            } catch (Error e) {
+            }
+            if (state.sender != sender) return;
+            bool owned = owner != null && owner == sender;
+            if (owned != state.app_owned) {
+                state.app_owned = owned;
+                schedule_save();
+            }
         }
 
         private void on_update(DBusConnection conn, string? sender,
                                 string object_path, string interface_name,
                                 string signal_name, Variant parameters) {
-            // parameters: (s, a{sv})
             if (!parameters.is_of_type(new VariantType("(sa{sv})"))) return;
             string app_uri = parameters.get_child_value(0).get_string();
-            Variant props = parameters.get_child_value(1);
-
-            string app_id = app_id_from_uri(app_uri);
-            if (app_id == null || app_id.length == 0) return;
-
-            var state = _by_app.has_key(app_id)
-                ? _by_app[app_id]
-                : new EntryState();
-            state.app_id = app_id;
-
-            // Per spec, properties are sparse - only the keys the sender
-            // wants to change are present. We MERGE into existing state.
-            var c = props.lookup_value("count", null);
-            if (c != null) {
-                if (c.is_of_type(VariantType.VARIANT)) c = c.get_variant();
-                if (c.is_of_type(VariantType.INT64)) state.count = c.get_int64();
-                else if (c.is_of_type(VariantType.INT32)) state.count = c.get_int32();
-            }
-            var cv = props.lookup_value("count-visible", null);
-            if (cv != null) {
-                if (cv.is_of_type(VariantType.VARIANT)) cv = cv.get_variant();
-                if (cv.is_of_type(VariantType.BOOLEAN)) state.count_visible = cv.get_boolean();
-            }
-            var p = props.lookup_value("progress", null);
-            if (p != null) {
-                if (p.is_of_type(VariantType.VARIANT)) p = p.get_variant();
-                if (p.is_of_type(VariantType.DOUBLE)) state.progress = p.get_double();
-            }
-            var pv = props.lookup_value("progress-visible", null);
-            if (pv != null) {
-                if (pv.is_of_type(VariantType.VARIANT)) pv = pv.get_variant();
-                if (pv.is_of_type(VariantType.BOOLEAN)) state.progress_visible = pv.get_boolean();
-            }
-            var u = props.lookup_value("urgent", null);
-            if (u != null) {
-                if (u.is_of_type(VariantType.VARIANT)) u = u.get_variant();
-                if (u.is_of_type(VariantType.BOOLEAN)) state.urgent = u.get_boolean();
-            }
-            // Non-standard extension: a human-readable name for the current
-            // activity. Surfaced as a label on the dock row when present.
-            var lbl = props.lookup_value("label", null);
-            if (lbl != null) {
-                if (lbl.is_of_type(VariantType.VARIANT)) lbl = lbl.get_variant();
-                if (lbl.is_of_type(VariantType.STRING)) state.label = lbl.get_string();
-            } else if (state.count == 0) {
-                // Sender cleared count → also drop a stale label.
-                state.label = null;
-            }
-            state.updated_at = GLib.get_monotonic_time();
-
-            if (!_by_app.has_key(app_id)) _by_app[app_id] = state;
-
-            // If everything is now invisible AND no urgent flag, drop the
-            // entry entirely so the dock item goes back to its normal look.
-            if (!state.count_visible && !state.progress_visible && !state.urgent) {
-                _by_app.unset(app_id);
-            }
-
+            if (EntryState.app_id_from_uri(app_uri) == null) return;
+            var state = _store.update(app_uri, sender, parameters.get_child_value(1));
+            if (sender != null && _by_app.has_key(state.app_id)) resolve_ownership.begin(state, sender);
+            schedule_save();
             this.changed("");
-        }
-
-        private static string? app_id_from_uri(string uri) {
-            // "application://name.desktop" → "name"
-            if (uri == null || uri.length == 0) return null;
-            string s = uri;
-            if (s.has_prefix("application://"))
-                s = s.substring("application://".length);
-            if (s.has_suffix(".desktop"))
-                s = s.substring(0, s.length - ".desktop".length);
-            return s.down();
         }
 
         private static string normalize(string id) {

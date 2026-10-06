@@ -1,9 +1,10 @@
 [Plugin]
 Module=clipboard-history
 Name=Clipboard History
-Description=Keeps a history of clipboard entries accessible from the panel
+Description=Deprecated: clipboard history is built into the desktop. Press Super+V or open Settings, Clipboard.
 Authors=Mirko
 Copyright=Copyright © 2025 Mirko
 Website=https://sinty.dev
 Builtin=false
-Hidden=false
+Hidden=true
+X-Singularity-Deprecated=Clipboard history is built into the desktop. Press Super+V or open Settings, Clipboard.

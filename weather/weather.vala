@@ -10,15 +10,20 @@ public void peas_register_types(TypeModule module) {
 }
 
 public class WeatherPlugin : Object, Singularity.Plugin {
+    private const int STALE_SECONDS = 1800;
     private PluginContext context;
-    private Button panel_btn;
+    private Button? panel_btn = null;
+    private Image weather_icon;
     private Label weather_label;
+    private FileMonitor? monitor = null;
     private uint refresh_timer_id = 0;
+    private int64 last_request = 0;
+    private string place_id = "";
+    private string summary = "";
 
-    // Cache: refresh every 30 minutes
-    private int64 last_fetch_time = 0;
-    private string cached_weather = "";
-    private const int CACHE_SECONDS = 1800;
+    private static string snapshot_path() {
+        return Path.build_filename(Environment.get_user_cache_dir(), "singularity-weather", "snapshot.json");
+    }
 
     public void activate(PluginContext ctx) {
         this.context = ctx;
@@ -26,29 +31,36 @@ public class WeatherPlugin : Object, Singularity.Plugin {
         panel_btn = new Button();
         panel_btn.add_css_class("flat");
         panel_btn.add_css_class("panel-button");
-        panel_btn.tooltip_text = "Weather (click to refresh)";
-        panel_btn.clicked.connect(() => {
-            last_fetch_time = 0; // Force refresh
-            fetch_weather.begin();
-        });
+        panel_btn.visible = false;
+        panel_btn.clicked.connect(open_weather);
 
         var btn_box = new Box(Orientation.HORIZONTAL, 4);
         btn_box.valign = Align.CENTER;
-        var icon = new Image.from_icon_name("weather-clear-symbolic");
-        icon.pixel_size = 14;
-        btn_box.append(icon);
-        weather_label = new Label("...");
+        weather_icon = new Image.from_icon_name("weather-few-clouds-symbolic");
+        weather_icon.pixel_size = 14;
+        btn_box.append(weather_icon);
+        weather_label = new Label("");
         weather_label.add_css_class("caption");
         btn_box.append(weather_label);
         panel_btn.set_child(btn_box);
 
         context.add_clock_suffix_widget(panel_btn);
 
-        fetch_weather.begin();
-        // Refresh every 30 minutes
-        refresh_timer_id = Timeout.add_seconds(CACHE_SECONDS, () => {
-            fetch_weather.begin();
-            return true;
+        try {
+            DirUtils.create_with_parents(Path.get_dirname(snapshot_path()), 0700);
+            monitor = File.new_for_path(snapshot_path()).monitor_file(FileMonitorFlags.NONE, null);
+            monitor.changed.connect((f, other, event) => {
+                if (event == FileMonitorEvent.CHANGES_DONE_HINT || event == FileMonitorEvent.CREATED || event == FileMonitorEvent.DELETED) {
+                    update_display();
+                }
+            });
+        } catch (Error e) {
+            warning("weather: %s", e.message);
+        }
+        update_display();
+        refresh_timer_id = Timeout.add_seconds(600, () => {
+            update_display();
+            return Source.CONTINUE;
         });
     }
 
@@ -57,8 +69,12 @@ public class WeatherPlugin : Object, Singularity.Plugin {
             Source.remove(refresh_timer_id);
             refresh_timer_id = 0;
         }
+        if (monitor != null) {
+            monitor.cancel();
+            monitor = null;
+        }
         if (panel_btn != null) {
-            context.remove_panel_widget(panel_btn);
+            context.remove_clock_suffix_widget(panel_btn);
             panel_btn = null;
         }
     }
@@ -69,85 +85,106 @@ public class WeatherPlugin : Object, Singularity.Plugin {
         box.margin_bottom = 12;
         box.margin_start = 12;
         box.margin_end = 12;
-        var lbl = new Label("Fetches weather from wttr.in. Caches for 30 minutes. Click the panel button to refresh.");
+        var lbl = new Label(_("Shows the temperature of the place selected in Weather, with its units. Click it to open Weather there."));
         lbl.wrap = true;
-        lbl.halign = Align.START;
+        lbl.xalign = 0;
         box.append(lbl);
-        if (cached_weather != "") {
-            var weather_lbl = new Label("Current: " + cached_weather);
-            weather_lbl.halign = Align.START;
+        if (summary != "") {
+            var weather_lbl = new Label(summary);
+            weather_lbl.xalign = 0;
+            weather_lbl.add_css_class("dim-label");
             box.append(weather_lbl);
         }
         return box;
     }
 
-    private async void fetch_weather() {
-        int64 now = GLib.get_monotonic_time() / 1000000;
-        if (cached_weather != "" && (now - last_fetch_time) < CACHE_SECONDS) {
-            update_display(cached_weather);
+    private void open_weather() {
+        if (place_id != "") call_app("show-place", new Variant.string(place_id));
+        else call_app("add-place", null);
+    }
+
+    private void call_app(string action, Variant? parameter) {
+        var parameters = new VariantBuilder(new VariantType("av"));
+        if (parameter != null) parameters.add("v", parameter);
+        var platform = new VariantBuilder(new VariantType("a{sv}"));
+        Bus.get.begin(BusType.SESSION, null, (o, r) => {
+            try {
+                var bus = Bus.get.end(r);
+                bus.call.begin("dev.sinty.weather", "/dev/sinty/weather", "org.freedesktop.Application", "ActivateAction",
+                    new Variant("(s@av@a{sv})", action, parameters.end(), platform.end()),
+                    null, DBusCallFlags.NONE, 30000, null, (obj, res) => {
+                        try {
+                            bus.call.end(res);
+                        } catch (Error e) {
+                            warning("weather: %s", e.message);
+                        }
+                    });
+            } catch (Error e) {
+                warning("weather: %s", e.message);
+            }
+        });
+    }
+
+    private Json.Object? read_selected(out bool stale) {
+        stale = true;
+        Json.Object root;
+        try {
+            string text;
+            FileUtils.get_contents(snapshot_path(), out text);
+            var parser = new Json.Parser();
+            parser.load_from_data(text);
+            var node = parser.get_root();
+            if (node == null || node.get_node_type() != Json.NodeType.OBJECT) return null;
+            root = node.get_object();
+        } catch (Error e) {
+            return null;
+        }
+        if (!root.has_member("places")) return null;
+        var places = root.get_array_member("places");
+        if (places.get_length() == 0) {
+            stale = false;
+            return null;
+        }
+        string selected = root.get_string_member_with_default("selected", "");
+        Json.Object? found = null;
+        foreach (var n in places.get_elements()) {
+            var obj = n.get_object();
+            if (found == null || obj.get_string_member_with_default("id", "") == selected) found = obj;
+            if (obj.get_string_member_with_default("id", "") == selected) break;
+        }
+        int64 fetched = found.get_int_member_with_default("fetched_at", 0);
+        stale = get_real_time() / 1000000 - fetched > STALE_SECONDS;
+        return found;
+    }
+
+    private void update_display() {
+        if (panel_btn == null) return;
+        bool stale;
+        var place = read_selected(out stale);
+        if (stale) {
+            int64 now = get_real_time() / 1000000;
+            if (now - last_request > 900) {
+                last_request = now;
+                call_app("refresh-snapshot", null);
+            }
+        }
+        if (place == null || !place.has_member("temperature")) {
+            panel_btn.visible = false;
+            place_id = place != null ? place.get_string_member_with_default("id", "") : "";
+            summary = "";
             return;
         }
-
-        // Use GLib.File to fetch from wttr.in (no API key needed)
-        // Format: condition + temperature
-        try {
-            var file = GLib.File.new_for_uri("https://wttr.in/?format=%C+%t");
-            var stream = yield file.read_async(Priority.LOW, null);
-            var data_stream = new DataInputStream(stream);
-            string? line = yield data_stream.read_line_async(Priority.LOW, null);
-            if (line != null) {
-                string weather = line.strip();
-                // Sanitize: remove degree sign weirdness, keep ASCII+degree
-                weather = weather.replace("+", "").replace("°F", "°F").replace("°C", "°C");
-                // Trim to reasonable length
-                if (weather.char_count() > 30) {
-                    weather = weather.substring(0, weather.index_of_nth_char(30)) + "…";
-                }
-                cached_weather = weather;
-                last_fetch_time = now;
-                update_display(weather);
-            }
-        } catch (Error e) {
-            // Network not available or wttr.in down - show cached or hide
-            if (cached_weather == "") {
-                if (weather_label != null) weather_label.label = "N/A";
-            }
+        place_id = place.get_string_member_with_default("id", "");
+        string temperature = place.get_string_member_with_default("temperature", "");
+        string condition = place.get_string_member_with_default("condition", "");
+        string name = place.get_string_member_with_default("name", "");
+        weather_label.label = temperature;
+        weather_icon.icon_name = place.get_string_member_with_default("icon", "weather-few-clouds") + "-symbolic";
+        summary = "%s: %s %s".printf(name, temperature, condition);
+        if (place.has_member("high")) {
+            summary = _("%s, high %s, low %s").printf(summary, place.get_string_member("high"), place.get_string_member("low"));
         }
-    }
-
-    private void update_display(string weather) {
-        if (weather_label == null) return;
-        // Map condition keywords to icon names
-        string icon_name = condition_to_icon(weather);
-        // Update the icon in the button
-        var box = panel_btn.get_child() as Box;
-        if (box != null) {
-            var child = box.get_first_child();
-            if (child is Image) {
-                ((Image) child).icon_name = icon_name;
-            }
-        }
-        // Show just temperature part if present
-        string display = weather;
-        // Extract temperature (last word that contains °)
-        var parts = weather.split(" ");
-        foreach (var p in parts) {
-            if ("°" in p) { display = p; break; }
-        }
-        weather_label.label = display;
-        panel_btn.tooltip_text = "Weather: " + weather + " (click to refresh)";
-    }
-
-    private string condition_to_icon(string condition) {
-        string lower = condition.down();
-        if ("clear" in lower || "sunny" in lower) return "weather-clear-symbolic";
-        if ("cloud" in lower || "overcast" in lower) return "weather-overcast-symbolic";
-        if ("partly" in lower) return "weather-few-clouds-symbolic";
-        if ("rain" in lower || "drizzle" in lower) return "weather-showers-symbolic";
-        if ("snow" in lower || "sleet" in lower) return "weather-snow-symbolic";
-        if ("storm" in lower || "thunder" in lower) return "weather-storm-symbolic";
-        if ("fog" in lower || "mist" in lower) return "weather-fog-symbolic";
-        if ("wind" in lower) return "weather-windy-symbolic";
-        return "weather-clear-symbolic";
+        panel_btn.tooltip_text = summary;
+        panel_btn.visible = true;
     }
 }
