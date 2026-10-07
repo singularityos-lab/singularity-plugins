@@ -34,7 +34,7 @@ public class SensorsPlugin : Object, Singularity.Plugin {
 }
 
 /**
- * SensorsIndicator — one compact chip in the panel, detail in a popover.
+ * SensorsIndicator - one compact chip in the panel, detail in a popover.
  *
  * Deliberately ONE panel item rather than a row of them: a machine can
  * expose a lot of sensors (a CIX Sky1 board reports five thermal zones; an
@@ -50,11 +50,8 @@ class SensorsIndicator : Gtk.Box {
     // Sensor counts vary by two orders of magnitude across platforms, so
     // the detail list is capped rather than unbounded.
     private const int MAX_ROWS_PER_GROUP = 6;
-    // Gdk.Monitor geometry is expressed in logical pixels.  Two 340px
-    // columns plus the popover margins fit comfortably from 1280px up;
-    // below that, keeping one column avoids a popover that dominates the
-    // display.
-    private const int TWO_COLUMN_MIN_WIDTH = 1280;
+    // Column count uses logical monitor geometry and is capped at three.
+    private const int MAX_DETAIL_COLUMNS = 3;
     private const int DETAIL_COLUMN_WIDTH = 340;
     private const int DETAIL_COLUMN_SPACING = 18;
     private const int DETAIL_SCREEN_MARGIN = 96;
@@ -64,13 +61,11 @@ class SensorsIndicator : Gtk.Box {
     private Box detail_box;
     private Box detail_toggle_box;
     private Box detail_columns_box;
-    private Box detail_left;
-    private Box detail_right;
+    private Box[] detail_columns;
     private Box detail_target;
     private ScrolledWindow detail_scroller;
-    private bool use_two_columns = false;
-    private int left_row_count = 0;
-    private int right_row_count = 0;
+    private int detail_column_count = 1;
+    private int[] detail_column_rows;
     private static Gtk.CssProvider? compact_rows_provider = null;
     private SensorMonitor monitor;
     private bool show_frequency = true;
@@ -127,7 +122,10 @@ class SensorsIndicator : Gtk.Box {
             compact_rows_provider = new Gtk.CssProvider();
             compact_rows_provider.load_from_string(
                 "row.sensors-compact-row { min-height: 0; padding: 0; " +
-                "background: transparent; border: 0; box-shadow: none; }");
+                "background: transparent; border: 0; box-shadow: none; } " +
+                ".sensors-resource-section { " +
+                "border: 1px solid alpha(@text_color, 0.12); " +
+                "border-radius: 8px; padding: 8px 10px; margin-bottom: 4px; }");
             Gtk.StyleContext.add_provider_for_display(get_display(),
                 compact_rows_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
@@ -145,15 +143,17 @@ class SensorsIndicator : Gtk.Box {
         detail_columns_box = new Box(Orientation.HORIZONTAL,
                                      DETAIL_COLUMN_SPACING);
         detail_columns_box.homogeneous = true;
-        detail_left = new Box(Orientation.VERTICAL, 8);
-        detail_right = new Box(Orientation.VERTICAL, 8);
-        detail_left.hexpand = true;
-        detail_right.hexpand = true;
-        detail_columns_box.append(detail_left);
-        detail_columns_box.append(detail_right);
+        detail_columns = new Box[MAX_DETAIL_COLUMNS];
+        detail_column_rows = new int[MAX_DETAIL_COLUMNS];
+        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+            detail_columns[i] = new Box(Orientation.VERTICAL, 8);
+            detail_columns[i].hexpand = true;
+            detail_columns[i].visible = i == 0;
+            detail_columns_box.append(detail_columns[i]);
+        }
         detail_box.append(detail_toggle_box);
         detail_box.append(detail_columns_box);
-        detail_target = detail_left;
+        detail_target = detail_columns[0];
 
         Popover popover = new Popover();
         // Natural size is the ordinary presentation.  Automatic vertical
@@ -331,14 +331,19 @@ class SensorsIndicator : Gtk.Box {
             screen_height = geometry.height;
         }
 
-        use_two_columns = screen_width >= TWO_COLUMN_MIN_WIDTH;
-        detail_right.visible = use_two_columns;
-        detail_columns_box.spacing = use_two_columns
+        int available_width = int.max(DETAIL_COLUMN_WIDTH, screen_width - DETAIL_SCREEN_MARGIN);
+        int density_slot = DETAIL_COLUMN_WIDTH * 2 + DETAIL_COLUMN_SPACING;
+        detail_column_count = int.min(MAX_DETAIL_COLUMNS,
+            int.max(1, (available_width + DETAIL_COLUMN_SPACING) / density_slot));
+
+        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+            detail_columns[i].visible = i < detail_column_count;
+        }
+        detail_columns_box.spacing = detail_column_count > 1
             ? DETAIL_COLUMN_SPACING : 0;
 
-        int content_width = use_two_columns
-            ? DETAIL_COLUMN_WIDTH * 2 + DETAIL_COLUMN_SPACING
-            : DETAIL_COLUMN_WIDTH;
+        int content_width = DETAIL_COLUMN_WIDTH * detail_column_count
+            + DETAIL_COLUMN_SPACING * (detail_column_count - 1);
         detail_scroller.min_content_width = content_width;
         detail_scroller.max_content_width = content_width;
         detail_scroller.max_content_height = int.max(320,
@@ -582,6 +587,7 @@ class SensorsIndicator : Gtk.Box {
 
     private Box begin_detail_section() {
         var section = new Box(Orientation.VERTICAL, 4);
+        section.add_css_class("sensors-resource-section");
         detail_target = section;
         return section;
     }
@@ -596,14 +602,15 @@ class SensorsIndicator : Gtk.Box {
             rows++;
         }
 
-        if (!use_two_columns || left_row_count <= right_row_count) {
-            detail_left.append(section);
-            left_row_count += rows;
-        } else {
-            detail_right.append(section);
-            right_row_count += rows;
+        int target_column = 0;
+        for (int i = 1; i < detail_column_count; i++) {
+            if (detail_column_rows[i] < detail_column_rows[target_column]) {
+                target_column = i;
+            }
         }
-        detail_target = detail_left;
+        detail_columns[target_column].append(section);
+        detail_column_rows[target_column] += rows;
+        detail_target = detail_columns[0];
     }
 
     private void add_heading(string title) {
@@ -1115,10 +1122,10 @@ class SensorsIndicator : Gtk.Box {
     /** Built only while the popover is open. */
     private void rebuild_details() {
         clear_box(detail_toggle_box);
-        clear_box(detail_left);
-        clear_box(detail_right);
-        left_row_count = 0;
-        right_row_count = 0;
+        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+            clear_box(detail_columns[i]);
+            detail_column_rows[i] = 0;
+        }
 
         // One control for the whole popover, at the top so its scope is
         // obvious before any section renders: it decides whether every
