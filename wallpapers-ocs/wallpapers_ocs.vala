@@ -31,7 +31,7 @@ namespace WallpapersOcs {
         public bool supports_search { get { return false; } }
         public Provider() { base("/usr/local/bin/ncz-wallpaper-ocs"); }
         public async ArrayList<WallpaperProviderChoice> choices(string index, Cancellable? cancel) throws Error {
-            return WallpaperOcs.categories(index, id);
+            return WallpaperOcs.categories(yield command({helper, "index"}, cancel, 90), id);
         }
         public async WallpaperProviderResult browse(string category, string query, int page,
                 bool refresh, Cancellable? cancel) throws Error {
