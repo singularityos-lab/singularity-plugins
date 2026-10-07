@@ -45,6 +45,7 @@ namespace WallpapersOcs {
                 "--pages", "1", "--page-size", OCS_PAGE_SIZE}, cancel, 60, refresh);
             var result = new WallpaperProviderResult();
             result.items = WallpaperOcs.items(data, network, network_category);
+            foreach (var item in result.items) item.owner_id = id;
             var response = WallpaperOcs.document(data);
             var failed = response.get_member("failed_networks");
             if (failed != null && failed.get_node_type() == Json.NodeType.ARRAY && failed.get_array().get_length() > 0)
