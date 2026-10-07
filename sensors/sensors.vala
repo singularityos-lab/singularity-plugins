@@ -72,6 +72,15 @@ class SensorsIndicator : Gtk.Box {
     private int left_row_count = 0;
     private int right_row_count = 0;
     private static Gtk.CssProvider? compact_rows_provider = null;
+    private Gtk.CssProvider? contrast_provider = null;
+    private SensorsContrast.Palette panel_palette;
+    private SensorsContrast.Palette popup_palette;
+    private uint contrast_source = 0;
+    private bool panel_backed = false;
+    private bool popup_backed = false;
+    private Gtk.WidgetPaintable? watched_paintable = null;
+    private ulong watched_handler = 0;
+    private ulong[] settings_handlers = {};
     private SensorMonitor monitor;
     private bool show_frequency = true;
     private bool show_utilization = true;
@@ -114,6 +123,8 @@ class SensorsIndicator : Gtk.Box {
         // glance shows WHICH figure needs attention, not just that one
         // does.
         summary_label.use_markup = true;
+        panel_palette = build_palette(theme_background());
+        popup_palette = panel_palette;
 
         button = new MenuButton();
         button.add_css_class("flat");
@@ -132,6 +143,7 @@ class SensorsIndicator : Gtk.Box {
                 compact_rows_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
         }
         detail_box = new Box(Orientation.VERTICAL, 4);
+        detail_box.add_css_class("sensors-detail");
         detail_box.margin_top = 10;
         detail_box.margin_bottom = 10;
         detail_box.margin_start = 12;
@@ -189,8 +201,21 @@ class SensorsIndicator : Gtk.Box {
             if (popover.visible) {
                 configure_detail_layout();
                 monitor.refresh();
+                schedule_contrast_refresh();
             }
         });
+        contrast_provider = new Gtk.CssProvider();
+        Gtk.StyleContext.add_provider_for_display(get_display(),
+            contrast_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+        var gtk_settings = Gtk.Settings.get_default();
+        if (gtk_settings != null) {
+            settings_handlers += gtk_settings.notify["gtk-theme-name"].connect(schedule_contrast_refresh);
+            settings_handlers += gtk_settings.notify["gtk-application-prefer-dark-theme"].connect(schedule_contrast_refresh);
+            settings_handlers += gtk_settings.notify["gtk-interface-color-scheme"].connect(schedule_contrast_refresh);
+        }
+        map.connect(watch_panel_background);
+        unmap.connect(unwatch_panel_background);
+        apply_contrast_css();
 
         monitor = new_sensor_monitor();
         util = new UtilizationMonitor();
@@ -281,6 +306,22 @@ class SensorsIndicator : Gtk.Box {
     }
 
     public override void dispose() {
+        var gtk_settings = Gtk.Settings.get_default();
+        if (gtk_settings != null) {
+            foreach (ulong id in settings_handlers) {
+                SignalHandler.disconnect(gtk_settings, id);
+            }
+        }
+        settings_handlers = {};
+        unwatch_panel_background();
+        if (contrast_source != 0) {
+            Source.remove(contrast_source);
+            contrast_source = 0;
+        }
+        if (contrast_provider != null) {
+            Gtk.StyleContext.remove_provider_for_display(get_display(), contrast_provider);
+            contrast_provider = null;
+        }
         monitor.updated.disconnect(on_updated);
         monitor.stop();
         util.updated.disconnect(on_updated);
@@ -357,40 +398,214 @@ class SensorsIndicator : Gtk.Box {
         return show_utilization && util.memory_fraction >= 0.0;
     }
 
-    /**
-     * Resolve a NAMED theme colour (e.g. "success_color") to a hex
-     * string for Pango markup.
-     *
-     * Markup spans take a literal colour, not a CSS variable, so the
-     * value has to be looked up at render time rather than written once
-     * -- this is what keeps it honest across a light/dark theme switch
-     * instead of baking in a colour that only happened to be right when
-     * the code was written. Falls back to the theme's plain text colour
-     * if the named token is ever missing, so a lookup failure degrades
-     * to unstyled text rather than invalid markup.
-     */
-    private string theme_color_hex(string color_name) {
-        // lookup_color lives on StyleContext, not on Widget directly
-        // (deprecated since GTK 4.10, but still the working path -- no
-        // non-deprecated replacement exists for resolving a NAMED CSS
-        // colour at runtime, only get_color() for the resolved `color`
-        // property itself).
+    private SensorsContrast.Color theme_background() {
         var style = summary_label.get_style_context();
         Gdk.RGBA rgba;
-        if (!style.lookup_color(color_name, out rgba)) {
-            if (!style.lookup_color("text_color", out rgba)) {
-                return "#ffffff";
-            }
+        if (style.lookup_color("window_bg_color", out rgba)
+            || style.lookup_color("theme_bg_color", out rgba)) {
+            return SensorsContrast.Color(rgba.red, rgba.green, rgba.blue, 1.0);
         }
-        return "#%02x%02x%02x".printf(
-            (uint) Math.round(rgba.red * 255),
-            (uint) Math.round(rgba.green * 255),
-            (uint) Math.round(rgba.blue * 255));
+        var gtk_settings = Gtk.Settings.get_default();
+        bool dark = gtk_settings != null && gtk_settings.gtk_application_prefer_dark_theme;
+        return dark ? SensorsContrast.Color(0.14, 0.14, 0.14) : SensorsContrast.Color(0.96, 0.96, 0.96);
     }
 
-    /** One coloured "dot value" segment for the compact chip. */
-    private string markup_segment(string color_hex, string text) {
-        return "<span color='%s'>\u25cf %s</span>".printf(color_hex, Markup.escape_text(text));
+    private SensorsContrast.Color? lookup_theme_color(string name) {
+        Gdk.RGBA rgba;
+        if (!summary_label.get_style_context().lookup_color(name, out rgba)) {
+            return null;
+        }
+        return SensorsContrast.Color(rgba.red, rgba.green, rgba.blue, 1.0);
+    }
+
+    private SensorsContrast.Palette build_palette(SensorsContrast.Color bg) {
+        return new SensorsContrast.Palette(bg, lookup_theme_color("success_color"),
+            lookup_theme_color("warning_color"), lookup_theme_color("error_color"),
+            lookup_theme_color("accent_color"));
+    }
+
+    private SensorsContrast.Color? sample_background(Gtk.Widget target, int pad, out bool translucent) {
+        translucent = false;
+        var native = target.get_native();
+        var native_widget = native as Gtk.Widget;
+        if (native == null || native_widget == null || !target.get_mapped()) {
+            return null;
+        }
+        Graphene.Rect inner;
+        if (!target.compute_bounds(native_widget, out inner)) {
+            return null;
+        }
+        var renderer = native.get_renderer();
+        if (renderer == null) {
+            return null;
+        }
+        float native_w = native_widget.get_width();
+        float native_h = native_widget.get_height();
+        float x0 = float.max(0.0f, inner.origin.x - pad);
+        float y0 = float.max(0.0f, inner.origin.y - pad);
+        float x1 = float.min(native_w, inner.origin.x + inner.size.width + pad);
+        float y1 = float.min(native_h, inner.origin.y + inner.size.height + pad);
+        if (x1 - x0 < 2.0f || y1 - y0 < 2.0f) {
+            return null;
+        }
+        var snapshot = new Gtk.Snapshot();
+        new Gtk.WidgetPaintable(native_widget).snapshot(snapshot, native_w, native_h);
+        Gsk.RenderNode? node = snapshot.free_to_node();
+        if (node == null) {
+            return null;
+        }
+        var viewport = Graphene.Rect().init(x0, y0, x1 - x0, y1 - y0);
+        Gdk.Texture texture = renderer.render_texture(node, viewport);
+        int tw = texture.get_width();
+        int th = texture.get_height();
+        var downloader = new Gdk.TextureDownloader(texture);
+        downloader.set_format(Gdk.MemoryFormat.R8G8B8A8);
+        size_t stride;
+        Bytes bytes = downloader.download_bytes(out stride);
+        unowned uint8[] data = bytes.get_data();
+        double sx = tw / (double) (x1 - x0);
+        double sy = th / (double) (y1 - y0);
+        int ix0 = (int) ((inner.origin.x - x0) * sx);
+        int iy0 = (int) ((inner.origin.y - y0) * sy);
+        int ix1 = (int) ((inner.origin.x + inner.size.width - x0) * sx);
+        int iy1 = (int) ((inner.origin.y + inner.size.height - y0) * sy);
+        var under = theme_background();
+        var samples = new SensorsContrast.Color[0];
+        double alpha_sum = 0.0;
+        int step = int.max(1, (tw * th) / 400);
+        for (int i = 0; i < tw * th; i += step) {
+            int px = i % tw;
+            int py = i / tw;
+            if (px >= ix0 && px < ix1 && py >= iy0 && py < iy1) {
+                continue;
+            }
+            size_t o = py * stride + px * 4;
+            if (o + 3 >= data.length) {
+                continue;
+            }
+            alpha_sum += data[o + 3] / 255.0;
+            samples += SensorsContrast.composite(
+                SensorsContrast.Color(data[o] / 255.0, data[o + 1] / 255.0,
+                                      data[o + 2] / 255.0, data[o + 3] / 255.0), under);
+        }
+        if (samples.length == 0) {
+            return null;
+        }
+        translucent = alpha_sum / samples.length < 0.95;
+        return SensorsContrast.median_by_luminance(samples);
+    }
+
+    private void schedule_contrast_refresh() {
+        if (contrast_source != 0) {
+            return;
+        }
+        contrast_source = Timeout.add(150, () => {
+            contrast_source = 0;
+            refresh_contrast();
+            return Source.REMOVE;
+        });
+    }
+
+    private SensorsContrast.Color resolve_surface(Gtk.Widget target, int pad, out bool scrim) {
+        var fallback = theme_background();
+        bool translucent;
+        var sampled = sample_background(target, pad, out translucent);
+        scrim = translucent;
+        if (translucent) {
+            return SensorsContrast.scrim_for(fallback);
+        }
+        return sampled ?? fallback;
+    }
+
+    private void refresh_contrast() {
+        bool panel_scrim;
+        var new_panel = build_palette(resolve_surface(button, 6, out panel_scrim));
+        var new_popup = new_panel;
+        bool popup_scrim = false;
+        Popover? popover = button.popover;
+        if (popover != null && popover.visible) {
+            new_popup = build_palette(resolve_surface(detail_box, 8, out popup_scrim));
+        } else {
+            new_popup = build_palette(theme_background());
+        }
+        bool changed = !new_panel.equals(panel_palette) || !new_popup.equals(popup_palette)
+            || panel_scrim != panel_backed || popup_scrim != popup_backed;
+        bool panel_changed = !new_panel.equals(panel_palette);
+        panel_palette = new_panel;
+        popup_palette = new_popup;
+        panel_backed = panel_scrim;
+        popup_backed = popup_scrim;
+        if (!changed) {
+            return;
+        }
+        apply_contrast_css();
+        if (panel_changed) {
+            on_updated();
+        } else if (popover != null && popover.visible) {
+            rebuild_details();
+        }
+    }
+
+    private static string scrim_css(SensorsContrast.Palette p) {
+        return "background-color: rgba(%d, %d, %d, 0.92); border-radius: 8px; ".printf(
+            (int) Math.round(p.bg.r * 255), (int) Math.round(p.bg.g * 255), (int) Math.round(p.bg.b * 255));
+    }
+
+    private void apply_contrast_css() {
+        if (contrast_provider == null) {
+            return;
+        }
+        var pn = panel_palette;
+        var pp = popup_palette;
+        contrast_provider.load_from_string(
+            ".sensors-summary { color: %s; opacity: 1; %s}\n".printf(
+                pn.neutral.to_hex(), panel_backed ? scrim_css(pn) + "padding: 2px 8px; " : "") +
+            ".sensors-detail { %s}\n".printf(popup_backed ? scrim_css(pp) : "") +
+            ".sensors-detail label { color: %s; opacity: 1; }\n".printf(pp.neutral.to_hex()) +
+            ".sensors-detail .sensors-muted, .sensors-detail .sensors-muted label { color: %s; opacity: 1; }\n".printf(pp.muted.to_hex()) +
+            ".sensors-detail label.sensors-hot { color: %s; font-weight: 600; opacity: 1; }\n".printf(pp.hot.to_hex()) +
+            ".sensors-detail label.sensors-crit { color: %s; font-weight: 800; opacity: 1; }\n".printf(pp.crit.to_hex()));
+    }
+
+    private void watch_panel_background() {
+        unwatch_panel_background();
+        var native = get_native() as Gtk.Widget;
+        if (native == null) {
+            return;
+        }
+        watched_paintable = new Gtk.WidgetPaintable(native);
+        watched_handler = watched_paintable.invalidate_contents.connect(schedule_contrast_refresh);
+        schedule_contrast_refresh();
+    }
+
+    private void unwatch_panel_background() {
+        if (watched_paintable != null && watched_handler != 0) {
+            watched_paintable.disconnect(watched_handler);
+        }
+        watched_paintable = null;
+        watched_handler = 0;
+    }
+
+    private string markup_segment(SensorsContrast.Color color, string glyph, string text, bool bold = false) {
+        string weight = bold ? " weight='bold'" : "";
+        return "<span color='%s'%s>%s %s</span>".printf(color.to_hex(), weight, glyph, Markup.escape_text(text));
+    }
+
+    private SensorsContrast.Color severity_color(Severity severity) {
+        switch (severity) {
+            case Severity.CRITICAL: return panel_palette.crit;
+            case Severity.HOT:      return panel_palette.hot;
+            case Severity.WARM:     return panel_palette.neutral;
+            default:                return panel_palette.ok;
+        }
+    }
+
+    private static string severity_glyph(Severity severity) {
+        switch (severity) {
+            case Severity.CRITICAL: return "\u25c6";
+            case Severity.HOT:      return "\u25b2";
+            default:                return "\u25cf";
+        }
     }
 
     private static int percent_of(double fraction) {
@@ -517,15 +732,17 @@ class SensorsIndicator : Gtk.Box {
 
         StringBuilder markup = new StringBuilder();
         if (primary >= 0) {
-            markup.append(markup_segment(theme_color_hex(severity_color_name(primary_severity)),
-                                          format_celsius(primary)));
+            markup.append(markup_segment(severity_color(primary_severity),
+                                          severity_glyph(primary_severity),
+                                          format_celsius(primary),
+                                          primary_severity == Severity.CRITICAL));
         }
         if (show_frequency && monitor.cpu_khz > 0) {
             if (markup.len > 0) markup.append("  ");
             // Clock speed is informational, never an alarm colour --
             // same reasoning as CPU below: running near the maximum is
             // the CPU doing its job, not a problem to flag red.
-            markup.append(markup_segment(theme_color_hex("accent_color"), format_clock(monitor.cpu_khz)));
+            markup.append(markup_segment(panel_palette.accent, "\u25cf", format_clock(monitor.cpu_khz)));
         }
         // Utilisation in the compact chip, not only in the popover.
         //
@@ -542,14 +759,16 @@ class SensorsIndicator : Gtk.Box {
                 // user to ignore the colour that does mean something --
                 // the same reasoning the popover's Clocks section and
                 // capacity_severity() already document.
-                markup.append(markup_segment(theme_color_hex("accent_color"),
+                markup.append(markup_segment(panel_palette.accent, "\u25cf",
                                               _("CPU %d%%").printf(percent_of(util.cpu_fraction))));
             }
             if (util.memory_fraction >= 0.0) {
                 if (markup.len > 0) markup.append("  ");
                 Severity mem_severity = capacity_severity(util.memory_fraction);
-                markup.append(markup_segment(theme_color_hex(severity_color_name(mem_severity)),
-                                              _("MEM %d%%").printf(percent_of(util.memory_fraction))));
+                markup.append(markup_segment(severity_color(mem_severity),
+                                              severity_glyph(mem_severity),
+                                              _("MEM %d%%").printf(percent_of(util.memory_fraction)),
+                                              mem_severity == Severity.CRITICAL));
             }
         }
         summary_label.label = markup.str;
@@ -637,7 +856,7 @@ class SensorsIndicator : Gtk.Box {
         Button toggle = new Button();
         toggle.has_frame = false;
         toggle.add_css_class("flat");
-        toggle.add_css_class("dim-label");
+        toggle.add_css_class("sensors-muted");
         toggle.label = sensors_grouped ? _("Grouped") : _("Ungrouped");
         toggle.clicked.connect(() => {
             sensors_grouped = !sensors_grouped;
@@ -666,31 +885,12 @@ class SensorsIndicator : Gtk.Box {
      * the first step of the ramp. Colour is spent only where it means
      * something: dim, plain, amber, red.
      */
-    /**
-     * Severity -> a named theme colour, for markup (not a CSS class).
-     *
-     * NORMAL reads as success (a calm "this is fine" green) rather than
-     * plain text, matching the standard status-dashboard convention the
-     * graphical chip is going for. WARM stays neutral -- the original
-     * design's severity_css() below also treats WARM as not yet worth
-     * flagging, and this mirrors that rather than inventing a new
-     * threshold.
-     */
-    private string severity_color_name(Severity severity) {
-        switch (severity) {
-            case Severity.CRITICAL: return "error_color";
-            case Severity.HOT:      return "warning_color";
-            case Severity.WARM:     return "text_color";
-            default:                return "success_color";
-        }
-    }
-
     private static string? severity_css(Severity severity) {
         switch (severity) {
-            case Severity.CRITICAL: return "error";
-            case Severity.HOT:      return "warning";
+            case Severity.CRITICAL: return "sensors-crit";
+            case Severity.HOT:      return "sensors-hot";
             case Severity.WARM:     return null;
-            default:                return "dim-label";
+            default:                return "sensors-muted";
         }
     }
 
@@ -740,7 +940,9 @@ class SensorsIndicator : Gtk.Box {
             double fill_w = double.max(h, w * f);
             double r, g, b;
             heat_rgb(f, out r, out g, out b);
-            cr.set_source_rgb(r, g, b);
+            var fill = SensorsContrast.ensure_contrast(SensorsContrast.Color(r, g, b),
+                                                       popup_palette.bg, 3.0);
+            cr.set_source_rgb(fill.r, fill.g, fill.b);
             rounded_rect(cr, 0, 0, fill_w, h, radius);
             cr.fill();
         });
@@ -780,7 +982,11 @@ class SensorsIndicator : Gtk.Box {
             row.append(make_heat_bar(heat));
         }
 
-        Label value_label = new Label(value);
+        string shown = value;
+        if (severity == Severity.CRITICAL || severity == Severity.HOT) {
+            shown = severity_glyph(severity) + " " + value;
+        }
+        Label value_label = new Label(shown);
         value_label.halign = Align.END;
         string? css = severity_css(severity);
         if (css != null) {
