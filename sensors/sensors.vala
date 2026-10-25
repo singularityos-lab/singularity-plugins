@@ -49,24 +49,56 @@ public class SensorsPlugin : Object, Singularity.Plugin {
 class SensorsIndicator : Gtk.Box {
     // Sensor counts vary by two orders of magnitude across platforms, so
     // the detail list is capped rather than unbounded.
-    private const int MAX_ROWS_PER_GROUP = 6;
+    private const int MAX_ROWS_PER_GROUP = 12;
     private const int MAX_DETAIL_COLUMNS = 3;
     private const int TWO_COLUMN_MIN_WIDTH = 1280;
     private const int THREE_COLUMN_MIN_WIDTH = 1920;
     private const int DETAIL_COLUMN_WIDTH = 340;
     private const int DETAIL_COLUMN_SPACING = 18;
     private const int DETAIL_SCREEN_MARGIN = 96;
+    private const int DETAIL_DOCK_CHROME = 64;
+    private const int DETAIL_EDGE_GAP = 8;
+    private const int DETAIL_MIN_HEIGHT = 240;
+
+    private class DetailTab {
+        public string id;
+        public string title;
+        public Box columns_box;
+        public Box[] columns;
+        public int[] rows;
+        public bool has_content = false;
+
+        public DetailTab(string id, string title) {
+            this.id = id;
+            this.title = title;
+            columns_box = new Box(Orientation.HORIZONTAL, DETAIL_COLUMN_SPACING);
+            columns_box.homogeneous = true;
+            columns = new Box[MAX_DETAIL_COLUMNS];
+            rows = new int[MAX_DETAIL_COLUMNS];
+            for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+                columns[i] = new Box(Orientation.VERTICAL, 8);
+                columns[i].hexpand = true;
+                columns[i].visible = i == 0;
+                columns_box.append(columns[i]);
+            }
+        }
+    }
+
+    private delegate void SectionFill();
 
     private MenuButton button;
     private Label summary_label;
     private Box detail_box;
     private Box detail_toggle_box;
-    private Box detail_columns_box;
-    private Box[] detail_columns;
+    private Box detail_switcher_box;
+    private Stack detail_stack;
+    private DetailTab[] detail_tabs;
+    private DetailTab current_tab;
+    private string detail_tab_signature = "";
+    private string active_tab = "cpu";
     private Box detail_target;
     private ScrolledWindow detail_scroller;
     private int detail_column_count = 1;
-    private int[] detail_column_rows;
     private static Gtk.CssProvider? compact_rows_provider = null;
     private Gtk.CssProvider? contrast_provider = null;
     private SensorsContrast.Palette panel_palette;
@@ -151,20 +183,25 @@ class SensorsIndicator : Gtk.Box {
         // row, a tall CPU section does not leave a matching blank hole
         // beneath a short GPU section in the opposite column.
         detail_toggle_box = new Box(Orientation.VERTICAL, 4);
-        detail_columns_box = new Box(Orientation.HORIZONTAL,
-                                     DETAIL_COLUMN_SPACING);
-        detail_columns_box.homogeneous = true;
-        detail_columns = new Box[MAX_DETAIL_COLUMNS];
-        detail_column_rows = new int[MAX_DETAIL_COLUMNS];
-        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
-            detail_columns[i] = new Box(Orientation.VERTICAL, 8);
-            detail_columns[i].hexpand = true;
-            detail_columns[i].visible = i == 0;
-            detail_columns_box.append(detail_columns[i]);
+        detail_switcher_box = new Box(Orientation.HORIZONTAL, 0);
+        detail_switcher_box.halign = Align.CENTER;
+        detail_stack = new Stack();
+        detail_stack.hhomogeneous = true;
+        detail_stack.vhomogeneous = false;
+        detail_tabs = {
+            new DetailTab("cpu", _("CPU")),
+            new DetailTab("processor", _("Processor")),
+            new DetailTab("memory", _("Memory & Storage")),
+            new DetailTab("hardware", _("Hardware"))
+        };
+        foreach (DetailTab tab in detail_tabs) {
+            detail_stack.add_named(tab.columns_box, tab.id);
         }
+        current_tab = detail_tabs[0];
         detail_box.append(detail_toggle_box);
-        detail_box.append(detail_columns_box);
-        detail_target = detail_columns[0];
+        detail_box.append(detail_switcher_box);
+        detail_box.append(detail_stack);
+        detail_target = current_tab.columns[0];
 
         Popover popover = new Popover();
         // Natural size is the ordinary presentation.  Automatic vertical
@@ -374,18 +411,41 @@ class SensorsIndicator : Gtk.Box {
         detail_column_count = screen_width >= THREE_COLUMN_MIN_WIDTH ? 3
             : screen_width >= TWO_COLUMN_MIN_WIDTH ? 2 : 1;
 
-        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
-            detail_columns[i].visible = i < detail_column_count;
+        foreach (DetailTab tab in detail_tabs) {
+            for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+                tab.columns[i].visible = i < detail_column_count;
+            }
+            tab.columns_box.spacing = detail_column_count > 1
+                ? DETAIL_COLUMN_SPACING : 0;
         }
-        detail_columns_box.spacing = detail_column_count > 1
-            ? DETAIL_COLUMN_SPACING : 0;
 
         int content_width = DETAIL_COLUMN_WIDTH * detail_column_count
             + DETAIL_COLUMN_SPACING * (detail_column_count - 1);
         detail_scroller.min_content_width = content_width;
         detail_scroller.max_content_width = content_width;
-        detail_scroller.max_content_height = int.max(320,
-            screen_height - DETAIL_SCREEN_MARGIN);
+        detail_scroller.max_content_height = detail_max_height(screen_height);
+    }
+
+    private int detail_max_height(int screen_height) {
+        int below_anchor = 0;
+        var root = get_root() as Gtk.Widget;
+        Graphene.Rect bounds;
+        if (root != null) {
+            if (button.compute_bounds(root, out bounds)) {
+                below_anchor = (int) Math.ceilf(bounds.origin.y + bounds.size.height);
+            }
+        }
+
+        int dock_icon = 48;
+        SettingsSchema? schema = settings != null ? settings.settings_schema : null;
+        if (schema != null && schema.has_key("dock-icon-size")) {
+            dock_icon = int.max(16, settings.get_int("dock-icon-size"));
+        }
+
+        int room = screen_height - below_anchor - dock_icon
+            - DETAIL_DOCK_CHROME - DETAIL_EDGE_GAP;
+        return int.max(DETAIL_MIN_HEIGHT,
+                       int.min(room, screen_height - DETAIL_SCREEN_MARGIN));
     }
 
     /**
@@ -728,13 +788,14 @@ class SensorsIndicator : Gtk.Box {
 
         int target_column = 0;
         for (int i = 1; i < detail_column_count; i++) {
-            if (detail_column_rows[i] < detail_column_rows[target_column]) {
+            if (current_tab.rows[i] < current_tab.rows[target_column]) {
                 target_column = i;
             }
         }
-        detail_columns[target_column].append(section);
-        detail_column_rows[target_column] += rows;
-        detail_target = detail_columns[0];
+        current_tab.columns[target_column].append(section);
+        current_tab.rows[target_column] += rows;
+        current_tab.has_content = true;
+        detail_target = current_tab.columns[0];
     }
 
     private void add_heading(string title) {
@@ -915,12 +976,11 @@ class SensorsIndicator : Gtk.Box {
      * in one render path and ignored in the other is how sensors-show-
      * frequency shipped a half-working toggle.
      */
-    private void add_utilization_details() {
+    private void add_processor_usage() {
         if (!show_utilization) {
             return;
         }
 
-        // ---- processor ----
         UtilizationReading[] cores = util.per_cpu();
         if (util.cpu_fraction >= 0.0 || cores.length > 0) {
             add_heading(_("Processor"));
@@ -958,7 +1018,13 @@ class SensorsIndicator : Gtk.Box {
             }
         }
 
-        // ---- memory ----
+    }
+
+    private void add_memory_usage() {
+        if (!show_utilization) {
+            return;
+        }
+
         if (util.memory_fraction >= 0.0) {
             add_heading(_("Memory"));
             add_row(_("RAM"),
@@ -976,7 +1042,13 @@ class SensorsIndicator : Gtk.Box {
             }
         }
 
-        // ---- storage ----
+    }
+
+    private void add_storage_usage() {
+        if (!show_utilization) {
+            return;
+        }
+
         CapacityReading[] volumes = util.filesystems();
         UtilizationReading[] spindles = util.disks();
         if (volumes.length > 0 || spindles.length > 0) {
@@ -1114,7 +1186,7 @@ class SensorsIndicator : Gtk.Box {
      * aggregate temperature for the whole CPU, and clock broken out by
      * cluster underneath it.
      */
-    private void add_cpu_section() {
+    private void add_cpu_section(bool clocks_part = false) {
         SensorReading[] cpu_temps = {};
         foreach (SensorReading reading in monitor.readings()) {
             if (reading.kind == SensorKind.CPU) {
@@ -1131,6 +1203,9 @@ class SensorsIndicator : Gtk.Box {
         }
 
         if (sensors_grouped) {
+            if (clocks_part) {
+                return;
+            }
             if (cpu_temps.length > 0) {
                 int64 sum = 0;
                 foreach (SensorReading reading in cpu_temps) {
@@ -1199,6 +1274,16 @@ class SensorsIndicator : Gtk.Box {
             return;
         }
 
+        if (clocks_part) {
+            if (clocks.length > 0) {
+                add_heading(_("Clocks"));
+                add_clock_rows(clocks);
+            }
+            return;
+        }
+        if (cpu_temps.length == 0) {
+            return;
+        }
         add_heading(_("CPU"));
         int shown = 0;
         int hidden = 0;
@@ -1217,11 +1302,9 @@ class SensorsIndicator : Gtk.Box {
             add_row(_("%d more").printf(hidden),
                     format_celsius((int) (hidden_millidegrees_sum / hidden)));
         }
-        // Raw, one row per cpufreq policy, in whatever order clocks()
-        // returned them -- no grouping, no averaging. The label is the
-        // policy's own sysfs directory name (e.g. "policy0"), the same
-        // identifier a person would see if they went and looked at
-        // /sys/devices/system/cpu/cpufreq/ themselves.
+    }
+
+    private void add_clock_rows(ClockReading[] clocks) {
         foreach (ClockReading c in clocks) {
             string value = c.max_khz > 0
                 ? "%s / %s".printf(format_clock(c.khz), format_clock(c.max_khz))
@@ -1230,12 +1313,63 @@ class SensorsIndicator : Gtk.Box {
         }
     }
 
+    private void add_section(SectionFill fill) {
+        Box section = begin_detail_section();
+        fill();
+        finish_detail_section(section);
+    }
+
+    private void select_tab(string id) {
+        foreach (DetailTab tab in detail_tabs) {
+            if (tab.id == id) {
+                current_tab = tab;
+                detail_target = tab.columns[0];
+                return;
+            }
+        }
+    }
+
+    private void refresh_detail_tabs() {
+        string signature = "";
+        foreach (DetailTab tab in detail_tabs) {
+            if (tab.has_content) signature += tab.id + ",";
+        }
+        bool active_ok = false;
+        foreach (DetailTab tab in detail_tabs) {
+            if (tab.has_content && tab.id == active_tab) active_ok = true;
+        }
+        if (!active_ok) {
+            foreach (DetailTab tab in detail_tabs) {
+                if (tab.has_content) { active_tab = tab.id; break; }
+            }
+        }
+        if (signature != detail_tab_signature) {
+            detail_tab_signature = signature;
+            clear_box(detail_switcher_box);
+            var switcher = new SegmentedControl();
+            foreach (DetailTab tab in detail_tabs) {
+                if (tab.has_content) switcher.add_option(tab.id, tab.title);
+            }
+            switcher.selected.connect((id) => {
+                active_tab = id;
+                detail_stack.visible_child_name = id;
+            });
+            detail_switcher_box.append(switcher);
+            detail_switcher_box.visible = signature.length > 0;
+            switcher.set_active(active_tab);
+        }
+        detail_stack.visible_child_name = active_tab;
+    }
+
     /** Built only while the popover is open. */
     private void rebuild_details() {
         clear_box(detail_toggle_box);
-        for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
-            clear_box(detail_columns[i]);
-            detail_column_rows[i] = 0;
+        foreach (DetailTab tab in detail_tabs) {
+            for (int i = 0; i < MAX_DETAIL_COLUMNS; i++) {
+                clear_box(tab.columns[i]);
+                tab.rows[i] = 0;
+            }
+            tab.has_content = false;
         }
 
         // One control for the whole popover, at the top so its scope is
@@ -1244,46 +1378,28 @@ class SensorsIndicator : Gtk.Box {
         detail_target = detail_toggle_box;
         add_sensors_toggle();
 
-        // Every kind the backend can name, hottest-silicon first and the
-        // board last. add_group() skips a kind with no sensors, so a PC
-        // that reports only CPU and GPU still shows exactly two headings.
-        //
-        // This list previously stopped at SYSTEM, which meant the wider
-        // kinds were classified and then silently dropped -- on Sky1 that
-        // hid eleven of nineteen readings, including the NVMe that was the
-        // only one worth looking at.
-        Box section = begin_detail_section();
-        add_cpu_section();
-        finish_detail_section(section);
+        select_tab("cpu");
+        add_section(() => add_cpu_section(false));
+        add_section(() => add_cpu_section(true));
 
-        section = begin_detail_section();
-        add_group(SensorKind.GPU,     _("GPU"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.NPU,     _("NPU"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.VPU,     _("VPU"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.MEMORY,  _("Memory"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.STORAGE, _("Storage"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.NETWORK, _("Network"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.BOARD,   _("Board"));
-        finish_detail_section(section);
-        section = begin_detail_section();
-        add_group(SensorKind.SYSTEM,  _("System"));
-        finish_detail_section(section);
+        select_tab("processor");
+        add_section(add_processor_usage);
 
-        section = begin_detail_section();
-        add_utilization_details();
-        finish_detail_section(section);
+        select_tab("memory");
+        add_section(() => add_group(SensorKind.MEMORY, _("Memory")));
+        add_section(add_memory_usage);
+        add_section(() => add_group(SensorKind.STORAGE, _("Storage")));
+        add_section(add_storage_usage);
+
+        select_tab("hardware");
+        add_section(() => add_group(SensorKind.GPU, _("GPU")));
+        add_section(() => add_group(SensorKind.NPU, _("NPU")));
+        add_section(() => add_group(SensorKind.VPU, _("VPU")));
+        add_section(() => add_group(SensorKind.SYSTEM, _("System")));
+        add_section(() => add_group(SensorKind.BOARD, _("Board")));
+        add_section(() => add_group(SensorKind.NETWORK, _("Network")));
+
+        refresh_detail_tabs();
     }
 
     private static SensorMonitor new_sensor_monitor() {
