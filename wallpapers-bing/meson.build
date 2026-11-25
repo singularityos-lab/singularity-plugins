@@ -19,3 +19,15 @@ configure_file(
   install: true,
   install_dir: get_option('libdir') / 'singularity/plugins/wallpapers-bing'
 )
+
+install_data('binghelper/binghelper',
+  rename: 'singularity-binghelper',
+  install_dir: get_option('bindir'),
+  install_mode: 'rwxr-xr-x'
+)
+
+python = find_program('python3')
+test('binghelper', python,
+  args: [files('tests/test_binghelper.py')],
+  env: {'BINGHELPER': meson.current_source_dir() / 'binghelper' / 'binghelper'}
+)
