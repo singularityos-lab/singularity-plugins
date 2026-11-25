@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+import concurrent.futures
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+APP_NAME = "singularity-binghelper"
+MARKET_FILE = CONFIG_HOME / "singularity" / "wallpapers-bing" / "market"
+DATA_ROOT = Path(os.environ.get("SINGULARITY_BINGHELPER_DATA", str(DATA_HOME / "singularity" / "wallpapers-bing")))
+THUMB_ROOT = Path(
+    os.environ.get("SINGULARITY_BINGHELPER_THUMBS", str(CACHE_HOME / "singularity" / "wallpapers-bing" / "thumbs"))
+)
+STAMP = CACHE_HOME / "singularity" / "wallpapers-bing" / "last-fetch"
+IMAGE_BASE = os.environ.get("SINGULARITY_BINGHELPER_IMAGE_BASE", "https://www.bing.com")
+API = os.environ.get("SINGULARITY_BINGHELPER_ENDPOINT", IMAGE_BASE + "/HPImageArchive.aspx")
+FIRST_BATCH = ((0, 8),)
+BACKFILL = ((0, 8), (7, 8))
+MARKET_RE = re.compile(r"^([A-Za-z]{2})-([A-Za-z]{2})$")
+DATE_RE = re.compile(r"^[0-9]{8}$")
+NAME_RE = re.compile(r"OHR\.([^_&]+)")
+NAME_WINDOW_DAYS = 4
+STALE_SECONDS = 20 * 3600
+MIN_FREE_BYTES = 512 * 1024 * 1024
+WORKERS = 4
+EX_TEMPFAIL = 75
+PROBE_HOST = os.environ.get("SINGULARITY_BINGHELPER_PROBE_HOST", "www.bing.com")
+PROBE_PORT = int(os.environ.get("SINGULARITY_BINGHELPER_PROBE_PORT", "443"))
+CONSOLIDATED_ID = "consolidated"
+CONSOLIDATED_NAME = "Combined (All Markets)"
+MARKET_NAMES = (
+    ("en-US", "United States"),
+    ("en-CA", "Canada English"),
+    ("fr-CA", "Canada French"),
+    ("pt-BR", "Brazil"),
+    ("en-GB", "United Kingdom"),
+    ("fr-FR", "France"),
+    ("de-DE", "Germany"),
+    ("es-ES", "Spain"),
+    ("it-IT", "Italy"),
+    ("en-IN", "India"),
+    ("ja-JP", "Japan"),
+    ("zh-CN", "China"),
+    ("ko-KR", "South Korea"),
+    ("en-AU", "Australia"),
+)
+DEFAULT_MARKETS = tuple(code for code, _ in MARKET_NAMES)
+
+USAGE = """usage: singularity-binghelper [command] [options]
+
+Bing daily wallpapers: a local archive, a combined view and an index.
+
+commands:
+  fetch [--if-stale] [--prefer M] [--preferred-only]
+        sync every market, the preferred market first; a photo another market
+        already served is hard-linked; --if-stale does nothing when the last
+        successful fetch is under 20 hours old; exits 75 when the network is
+        unreachable; skips metered links; --preferred-only fetches only the
+        preferred market's first batch
+  pick | latest | info
+        print one archived image or its attribution
+  list [--all | --consolidated | <market>...] [--prefer M]
+        archive entries as JSON; --consolidated is one row per photograph
+  markets
+        "<code><TAB><name>" per line, "consolidated" first
+  market [M]
+        print the preferred market, or store M (a market code, all or auto)
+  consolidate [--prefer M]
+        rebuild the de-duplicated view
+  pin | unpin <market> <yyyymmdd>
+
+preferred market, first match wins:
+  --prefer M, $SINGULARITY_BINGHELPER_MARKETS,
+  ~/.config/singularity/wallpapers-bing/market, then the session locale
+
+environment:
+  SINGULARITY_BINGHELPER_DATA, _THUMBS, _ENDPOINT, _IMAGE_BASE, _MARKETS,
+  _RETENTION_DAYS, _IGNORE_METERED, _QUIET
+"""
+
+PREFER = None
+IF_STALE = False
+PREFERRED_ONLY = False
+REACHED = False
+LIST_CALLS = 0
+LIST_FAILURES = 0
+INDEX_LOCK = threading.Lock()
+
+
+def log(msg):
+    if not os.environ.get("SINGULARITY_BINGHELPER_QUIET"):
+        print(f"[bing] {msg}", file=sys.stderr)
+
+
+def split_tokens(text):
+    return [tok for tok in re.split(r"[\s,]+", text.strip()) if tok]
+
+
+def match_market(language, region=""):
+    language = language.lower()
+    region = region.upper()
+    if region and f"{language}-{region}" in DEFAULT_MARKETS:
+        return f"{language}-{region}"
+    if language == "en":
+        return "en-US"
+    for code in DEFAULT_MARKETS:
+        if code.startswith(language + "-"):
+            return code
+    return None
+
+
+def locale_names():
+    names = [n for n in os.environ.get("LANGUAGE", "").split(":") if n]
+    names += [os.environ[v] for v in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(v)]
+    if names:
+        return names
+    for path in (CONFIG_HOME / "locale.conf", Path("/etc/locale.conf"), Path("/etc/default/locale")):
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() in ("LC_ALL", "LC_MESSAGES", "LANG"):
+                names.append(value.strip().strip("\"'"))
+        if names:
+            break
+    return names
+
+
+def locale_market():
+    for name in locale_names():
+        m = re.match(r"^([A-Za-z]{2,3})(?:[_-]([A-Za-z]{2}))?(?![A-Za-z])", name)
+        if not m:
+            continue
+        found = match_market(m.group(1), m.group(2) or "")
+        if found:
+            return found
+    return "en-US"
+
+
+def configured_text():
+    text = os.environ.get("SINGULARITY_BINGHELPER_MARKETS", "")
+    if not text and MARKET_FILE.is_file():
+        text = MARKET_FILE.read_text(errors="ignore")
+    return text
+
+
+def preferred_market():
+    text = (PREFER if PREFER is not None else configured_text()).strip()
+    if text.lower() == "all":
+        return None
+    for token in split_tokens(text):
+        m = MARKET_RE.match(token)
+        if m:
+            return match_market(m.group(1), m.group(2)) or locale_market()
+    return locale_market()
+
+
+def market_order(preferred, markets):
+    rest = sorted(markets)
+    if not preferred:
+        return rest
+    order = [preferred] if preferred in rest else []
+    language = preferred.split("-")[0]
+    order += [m for m in rest if m.startswith(language + "-") and m not in order]
+    if "en-US" in rest and "en-US" not in order:
+        order.append("en-US")
+    return order + [m for m in rest if m not in order]
+
+
+class Lock:
+    def __init__(self, wait=0):
+        self.wait = wait
+        self.handle = None
+
+    def __enter__(self):
+        base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        path = Path(base) / f"{APP_NAME}-{os.getuid()}.lock"
+        self.handle = open(path, "w")
+        deadline = datetime.datetime.now().timestamp() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if datetime.datetime.now().timestamp() >= deadline:
+                    return False
+                time.sleep(0.5)
+
+    def __exit__(self, *_exc):
+        self.handle.close()
+
+
+def metered():
+    if os.environ.get("SINGULARITY_BINGHELPER_IGNORE_METERED"):
+        return False
+    try:
+        out = subprocess.run(
+            [
+                "busctl",
+                "--system",
+                "get-property",
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager",
+                "org.freedesktop.NetworkManager",
+                "Metered",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.split()
+        return bool(out) and out[-1] in ("1", "3")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def retention_days():
+    raw = os.environ.get("SINGULARITY_BINGHELPER_RETENTION_DAYS", "")
+    if raw.lower() in ("", "default"):
+        return 365
+    if raw.lower() in ("0", "forever", "none", "never"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 365
+
+
+def all_archived_markets():
+    if not DATA_ROOT.is_dir():
+        return []
+    return sorted(p.name for p in DATA_ROOT.iterdir() if p.is_dir() and MARKET_RE.match(p.name))
+
+
+def reachable():
+    try:
+        with socket.create_connection((PROBE_HOST, PROBE_PORT), timeout=4):
+            return True
+    except OSError:
+        return False
+
+
+def fetch_json(market, idx, n):
+    global REACHED, LIST_CALLS
+    LIST_CALLS += 1
+    params = urllib.parse.urlencode({"format": "js", "idx": idx, "n": n, "mkt": market})
+    with urllib.request.urlopen(f"{API}?{params}", timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    REACHED = True
+    return data
+
+
+def image_url(urlbase, tier):
+    return IMAGE_BASE + urlbase + tier + ".jpg"
+
+
+def download(url, dest, timeout=90):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dest.name + ".", suffix=".part", dir=str(dest.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response, tmp.open("wb") as out:
+            while True:
+                chunk = response.read(1024 * 128)
+                if not chunk:
+                    break
+                out.write(chunk)
+        expected = response.headers.get("Content-Length")
+        if tmp.stat().st_size == 0 or (expected and int(expected) != tmp.stat().st_size):
+            raise RuntimeError("empty or truncated download")
+        os.chmod(tmp, 0o644)
+        tmp.replace(dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def shared_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def image_name(urlbase):
+    m = NAME_RE.search(urlbase or "")
+    return m.group(1) if m else ""
+
+
+def day_number(date):
+    return datetime.date(int(date[:4]), int(date[4:6]), int(date[6:])).toordinal()
+
+
+def normalize_image(image, market):
+    date = str(image.get("startdate", "")).strip()
+    urlbase = str(image.get("urlbase", "")).strip()
+    if not DATE_RE.match(date) or not urlbase:
+        return None
+    return {
+        "schema": 1,
+        "provider": "bing",
+        "market": market,
+        "date": date,
+        "enddate": str(image.get("enddate", "")).strip(),
+        "urlbase": urlbase,
+        "caption": str(image.get("title", "")).replace("\n", " ").strip(),
+        "copyright": str(image.get("copyright", "")).replace("\n", " ").strip(),
+        "copyrightlink": str(image.get("copyrightlink", "")).strip(),
+        "quiz": str(image.get("quiz", "")).strip(),
+        "hsh": str(image.get("hsh", "")).strip(),
+    }
+
+
+def read_meta(path, market, date):
+    meta_path = path.with_suffix(".json")
+    txt_path = path.with_suffix(".txt")
+    meta = {}
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(errors="ignore"))
+        except (OSError, ValueError):
+            meta = {}
+    meta.setdefault("provider", "bing")
+    meta.setdefault("market", market)
+    meta.setdefault("date", date)
+    meta.setdefault("caption", "")
+    meta.setdefault("copyright", "")
+    if txt_path.is_file() and (not meta["caption"] or not meta["copyright"]):
+        try:
+            lines = txt_path.read_text(errors="ignore").splitlines()
+        except OSError:
+            lines = []
+        if lines:
+            meta["caption"] = meta["caption"] or lines[0]
+        if len(lines) > 1:
+            meta["copyright"] = meta["copyright"] or lines[1]
+    return meta
+
+
+def write_sidecars(directory, meta):
+    date = meta["date"]
+    txt_path = directory / f"{date}.txt"
+    json_path = directory / f"{date}.json"
+    if not txt_path.exists():
+        txt_path.write_text(f"{meta.get('caption', '')}\n{meta.get('copyright', '')}\n")
+        os.chmod(txt_path, 0o644)
+    if not json_path.exists():
+        json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        os.chmod(json_path, 0o644)
+
+
+def is_pinned(path):
+    return path.with_suffix(".pinned").exists()
+
+
+def local_index():
+    index = {}
+    for market in all_archived_markets():
+        for image in (DATA_ROOT / market).glob("*.jpg"):
+            if not DATE_RE.match(image.stem):
+                continue
+            try:
+                urlbase = json.loads(image.with_suffix(".json").read_text(errors="ignore")).get("urlbase", "")
+            except (OSError, ValueError, AttributeError):
+                continue
+            name = image_name(urlbase)
+            if name:
+                index.setdefault(name, []).append((image.stem, image))
+    return index
+
+
+def find_local(index, name, date):
+    for other_date, image in index.get(name, []):
+        try:
+            near = abs(day_number(other_date) - day_number(date)) <= NAME_WINDOW_DAYS
+            if near and image.stat().st_size > 0:
+                return image
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def list_market(market, batches):
+    global LIST_FAILURES
+    metas = []
+    seen = set()
+    for idx, n in batches:
+        try:
+            payload = fetch_json(market, idx, n)
+        except Exception as exc:
+            LIST_FAILURES += 1
+            log(f"{market}: fetch idx={idx} failed: {exc}")
+            continue
+        for image in payload.get("images", []):
+            meta = normalize_image(image, market)
+            if meta and meta["date"] not in seen:
+                seen.add(meta["date"])
+                metas.append(meta)
+    return metas
+
+
+def materialize(meta, index):
+    market = meta["market"]
+    directory = DATA_ROOT / market
+    out = directory / f"{meta['date']}.jpg"
+    downloaded = 0
+    if not out.exists():
+        shared_dir(directory)
+        name = image_name(meta["urlbase"])
+        with INDEX_LOCK:
+            source = find_local(index, name, meta["date"]) if name else None
+        linked = False
+        if source is not None:
+            try:
+                os.link(source, out)
+                linked = True
+            except OSError:
+                pass
+        if not linked:
+            try:
+                try:
+                    download(image_url(meta["urlbase"], "_UHD"), out)
+                except Exception:
+                    download(image_url(meta["urlbase"], "_1920x1080"), out)
+                downloaded = 1
+                log(f"{market}: cached {meta['date']} ({out.stat().st_size} bytes)")
+            except Exception as exc:
+                log(f"{market}: image {meta['date']} failed: {exc}")
+                return 0
+        if name:
+            with INDEX_LOCK:
+                index.setdefault(name, []).append((meta["date"], out))
+    write_sidecars(directory, meta)
+    return downloaded
+
+
+def sync(markets, batches, index):
+    global REACHED
+    metas = []
+    for market in markets:
+        metas += list_market(market, batches)
+        if not REACHED:
+            break
+    groups = {}
+    for meta in metas:
+        groups.setdefault(image_name(meta["urlbase"]) or meta["market"] + meta["date"], []).append(meta)
+
+    def run(group):
+        return sum(materialize(meta, index) for meta in group)
+
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        total = sum(pool.map(run, groups.values()))
+    for market in markets:
+        prune_market(market)
+    return total
+
+
+def prune_market(market):
+    keep_days = retention_days()
+    if keep_days <= 0:
+        return
+    cutoff = (datetime.datetime.now(datetime.UTC).date() - datetime.timedelta(days=keep_days)).strftime("%Y%m%d")
+    directory = DATA_ROOT / market
+    for image in sorted(directory.glob("*.jpg")):
+        if DATE_RE.match(image.stem) and image.stem < cutoff and not is_pinned(image):
+            for suffix in (".jpg", ".txt", ".json"):
+                image.with_suffix(suffix).unlink(missing_ok=True)
+            log(f"{market}: pruned {image.stem}")
+
+
+def archive_entries(markets):
+    entries = []
+    for market in markets:
+        directory = DATA_ROOT / market
+        if not directory.is_dir():
+            continue
+        for image in directory.glob("*.jpg"):
+            if DATE_RE.match(image.stem):
+                entries.append((image.stem, market, image, read_meta(image, market, image.stem)))
+    return sorted(entries, key=lambda item: (item[0], item[1], str(item[2])), reverse=True)
+
+
+def consolidated_dir():
+    return DATA_ROOT / "consolidated"
+
+
+def read_manifest():
+    try:
+        manifest = json.loads((consolidated_dir() / "index.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [item for item in manifest if isinstance(item, dict)] if isinstance(manifest, list) else []
+
+
+def view_rows(preferred):
+    rows = []
+    for item in read_manifest():
+        path = Path(item.get("path", ""))
+        if not path.exists():
+            continue
+        copies = item.get("copies") or [{"market": item.get("market", ""), "date": item.get("date", "")}]
+        by_market = {c["market"]: c["date"] for c in copies}
+        market, date = item.get("market", ""), item.get("date", "")
+        if preferred and by_market:
+            market = market_order(preferred, list(by_market))[0]
+            date = by_market[market]
+        real = DATA_ROOT / market / f"{date}.jpg"
+        meta = read_meta(real if real.exists() else path, market, date)
+        pinned = any(is_pinned(DATA_ROOT / m / f"{d}.jpg") for m, d in by_market.items())
+        rows.append((date, market, path, meta, pinned, bool(preferred) and preferred in by_market))
+    rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+    if preferred:
+        rows.sort(key=lambda r: not r[5])
+    return [r[:5] for r in rows]
+
+
+def deduped_archive_entries(markets):
+    rows = view_rows(preferred_market())
+    if rows:
+        return [row[:4] for row in rows]
+    return archive_entries(markets)
+
+
+def sha256_of(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def relink(dst, src):
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    dst.symlink_to(src)
+
+
+def consolidate_locked(preferred):
+    markets = market_order(preferred, all_archived_markets())
+    seen = {}
+    copies = {}
+    by_inode = {}
+    for market in markets:
+        for image in sorted((DATA_ROOT / market).glob("*.jpg")):
+            date = image.stem
+            if not DATE_RE.match(date):
+                continue
+            try:
+                st = image.stat()
+                if st.st_size == 0:
+                    continue
+                key = (st.st_dev, st.st_ino)
+                if key not in by_inode:
+                    by_inode[key] = sha256_of(image)
+                digest = by_inode[key]
+            except OSError as exc:
+                log(f"consolidate: {market}/{image.name}: could not hash: {exc}")
+                continue
+            copies.setdefault(digest, []).append({"market": market, "date": date})
+            seen.setdefault(digest, (market, date, image))
+
+    final = consolidated_dir()
+    staging = DATA_ROOT / ".consolidated.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for digest, (market, date, image) in seen.items():
+        market_dir = staging / market
+        market_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            relink(market_dir / f"{date}.jpg", image)
+        except OSError as exc:
+            log(f"consolidate: {market}/{image.name}: symlink failed: {exc}")
+            continue
+        for suffix in (".txt", ".json"):
+            src = image.with_suffix(suffix)
+            if src.exists():
+                try:
+                    relink(market_dir / f"{date}{suffix}", src)
+                except OSError as exc:
+                    log(f"consolidate: {market}/{src.name}: sidecar symlink failed: {exc}")
+        meta = read_meta(image, market, date)
+        manifest.append(
+            {
+                "provider": "bing",
+                "market": market,
+                "date": date,
+                "path": str(final / market / f"{date}.jpg"),
+                "source_path": str(image),
+                "sha256": digest,
+                "caption": meta.get("caption", ""),
+                "copyright": meta.get("copyright", ""),
+                "copies": copies[digest],
+            }
+        )
+    manifest.sort(key=lambda item: (item["date"], item["market"]), reverse=True)
+    (staging / "index.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    old = DATA_ROOT / ".consolidated.old"
+    shutil.rmtree(old, ignore_errors=True)
+    try:
+        if final.exists():
+            os.rename(final, old)
+        try:
+            os.rename(staging, final)
+        except OSError:
+            if old.exists() and not final.exists():
+                os.rename(old, final)
+            raise
+    except OSError as exc:
+        log(f"consolidate: cannot replace {final}: {exc}")
+        shutil.rmtree(staging, ignore_errors=True)
+        return 1
+    shutil.rmtree(old, ignore_errors=True)
+    log(f"consolidate: {len(manifest)} unique image(s) from {len(markets)} market(s), preferred {preferred or 'none'}")
+    return 0 if manifest else 1
+
+
+def ensure_thumb(meta):
+    urlbase = meta.get("urlbase", "")
+    market = meta.get("market", "")
+    date = meta.get("date", "")
+    if not urlbase or not market or not date:
+        return ""
+    thumb = THUMB_ROOT / market / f"{date}_400x240.jpg"
+    if not thumb.exists():
+        try:
+            download(image_url(urlbase, "_400x240"), thumb, timeout=45)
+        except Exception as exc:
+            log(f"{market}: thumbnail {date} failed: {exc}")
+            return ""
+    return str(thumb)
+
+
+def thumbs_for(metas):
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(ensure_thumb, metas))
+
+
+def fresh():
+    try:
+        age = datetime.datetime.now().timestamp() - STAMP.stat().st_mtime
+    except OSError:
+        return False
+    manifest = consolidated_dir() / "index.json"
+    try:
+        return 0 <= age < STALE_SECONDS and manifest.stat().st_size > 2
+    except OSError:
+        return False
+
+
+def cmd_fetch(_args):
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    with Lock() as got:
+        if not got:
+            log("another fetch is running")
+            return 0
+        if IF_STALE and fresh():
+            thumbs_for([row[3] for row in view_rows(preferred_market())])
+            return 0
+        if metered():
+            log("metered connection, skipping")
+            return 0
+        try:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(DATA_ROOT).free
+        except OSError as exc:
+            log(f"cache unavailable: {exc}")
+            return EX_TEMPFAIL
+        if free < MIN_FREE_BYTES:
+            log("less than 512 MiB free, skipping")
+            return 1
+        preferred = preferred_market()
+        order = market_order(preferred, DEFAULT_MARKETS)
+        index = local_index()
+        if not reachable():
+            log("network unreachable (connect probe)")
+            return EX_TEMPFAIL
+        sync(order[:1], FIRST_BATCH, index)
+        if not REACHED:
+            log("network unreachable")
+            return EX_TEMPFAIL
+        consolidated_ok = consolidate_locked(preferred)
+        thumbs_for([row[3] for row in view_rows(preferred)])
+        if PREFERRED_ONLY:
+            if consolidated_ok != 0:
+                log("preferred market produced no usable image")
+                return EX_TEMPFAIL
+            try:
+                STAMP.parent.mkdir(parents=True, exist_ok=True)
+                STAMP.touch()
+            except OSError:
+                pass
+            return 0
+        calls, failures = LIST_CALLS, LIST_FAILURES
+        sync(order, BACKFILL, index)
+        consolidate_locked(preferred)
+        thumbs_for([row[3] for row in view_rows(preferred)])
+        if LIST_FAILURES - failures >= LIST_CALLS - calls:
+            log("backfill failed for every market")
+            return EX_TEMPFAIL
+        try:
+            STAMP.parent.mkdir(parents=True, exist_ok=True)
+            STAMP.touch()
+        except OSError:
+            pass
+        return 0
+
+
+def cmd_pick(_args):
+    entries = deduped_archive_entries(DEFAULT_MARKETS)
+    if not entries:
+        return 1
+    print(random.choice(entries)[2])
+    return 0
+
+
+def cmd_latest(_args):
+    entries = deduped_archive_entries(DEFAULT_MARKETS)
+    if not entries:
+        return 1
+    print(entries[0][2])
+    return 0
+
+
+def cmd_info(_args):
+    entries = deduped_archive_entries(DEFAULT_MARKETS)
+    if not entries:
+        return 1
+    print(entries[0][3].get("caption", ""))
+    print(entries[0][3].get("copyright", ""))
+    return 0
+
+
+def cmd_list(args):
+    args = list(args)
+    consolidated = False
+    for token in ("--consolidated", CONSOLIDATED_ID):
+        while token in args:
+            args.remove(token)
+            consolidated = True
+    if consolidated:
+        rows = view_rows(preferred_market())
+        if not rows:
+            rows = [e + (is_pinned(e[2]),) for e in archive_entries(DEFAULT_MARKETS)]
+    elif args and args[0] == "--all":
+        rows = [e + (is_pinned(e[2]),) for e in archive_entries(all_archived_markets())]
+    elif args:
+        rows = [e + (is_pinned(e[2]),) for e in archive_entries([m for m in args if MARKET_RE.match(m)])]
+    else:
+        rows = [e + (is_pinned(e[2]),) for e in archive_entries(DEFAULT_MARKETS)]
+    thumbs = thumbs_for([row[3] for row in rows])
+    out = []
+    for (date, market, image, meta, pinned), thumb in zip(rows, thumbs):
+        out.append(
+            {
+                "provider": "bing",
+                "date": date,
+                "market": market,
+                "path": str(image),
+                "caption": meta.get("caption", ""),
+                "copyright": meta.get("copyright", ""),
+                "thumbnail_path": thumb,
+                "pinned": pinned,
+            }
+        )
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_pin(args, pinned):
+    usage = f"usage: {APP_NAME} pin|unpin <market> <yyyymmdd>"
+    if len(args) != 2 or not MARKET_RE.match(args[0]) or not DATE_RE.match(args[1]):
+        print(usage, file=sys.stderr)
+        return 2
+    marker = DATA_ROOT / args[0] / f"{args[1]}.pinned"
+    if not marker.with_suffix(".jpg").exists():
+        print(f"no archived image: {marker.with_suffix('.jpg')}", file=sys.stderr)
+        return 1
+    if pinned:
+        marker.write_text("pinned\n")
+    else:
+        marker.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_markets(_args):
+    print(f"{CONSOLIDATED_ID}\t{CONSOLIDATED_NAME}")
+    for code, name in MARKET_NAMES:
+        print(f"{code}\t{name}")
+    return 0
+
+
+def cmd_market(args):
+    if not args:
+        print(preferred_market() or "all")
+        return 0
+    value = args[0].strip()
+    low = value.lower()
+    if low in ("all", "consolidated", CONSOLIDATED_ID):
+        value = "all"
+    elif low == "auto":
+        value = "auto"
+    else:
+        m = MARKET_RE.match(value)
+        value = f"{m.group(1).lower()}-{m.group(2).upper()}" if m else None
+        if value not in DEFAULT_MARKETS:
+            print(f"market: unknown market {args[0]!r}", file=sys.stderr)
+            return 2
+    MARKET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MARKET_FILE.with_name(MARKET_FILE.name + ".tmp")
+    tmp.write_text(value + "\n")
+    os.replace(tmp, MARKET_FILE)
+    return 0
+
+
+def cmd_consolidate(_args):
+    with Lock(wait=120) as got:
+        if not got:
+            log("consolidate: lock busy")
+            return 1
+        return consolidate_locked(preferred_market())
+
+
+def take_options(args):
+    global PREFER, IF_STALE, PREFERRED_ONLY
+    rest = []
+    it = iter(args)
+    for arg in it:
+        if arg == "--prefer":
+            PREFER = next(it, "")
+        elif arg.startswith("--prefer="):
+            PREFER = arg.split("=", 1)[1]
+        elif arg == "--if-stale":
+            IF_STALE = True
+        elif arg == "--preferred-only":
+            PREFERRED_ONLY = True
+        else:
+            rest.append(arg)
+    return rest
+
+
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help"):
+    print(USAGE)
+    raise SystemExit(0)
+cmd = sys.argv[1] if len(sys.argv) > 1 else "fetch"
+args = take_options(sys.argv[2:])
+commands = {
+    "fetch": cmd_fetch,
+    "pick": cmd_pick,
+    "latest": cmd_latest,
+    "info": cmd_info,
+    "list": cmd_list,
+    "markets": cmd_markets,
+    "market": cmd_market,
+    "consolidate": cmd_consolidate,
+}
+if cmd == "pin":
+    raise SystemExit(cmd_pin(args, True))
+if cmd == "unpin":
+    raise SystemExit(cmd_pin(args, False))
+if cmd not in commands:
+    print(USAGE, file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(commands[cmd](args))
