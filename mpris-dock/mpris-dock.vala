@@ -13,7 +13,7 @@ public void peas_register_types(TypeModule module) {
 namespace MprisDock {
 
     public class Extension : Object, Singularity.DockItemExtension {
-        // Cached state, refreshed every poll tick.
+        // Cached state, refreshed when players appear, vanish or change.
         public class Entry {
             public string mpris_name;
             public string player_id;   // lower-case substring after the prefix
@@ -24,18 +24,14 @@ namespace MprisDock {
         }
 
         private HashMap<string, Entry> _by_app = new HashMap<string, Entry>();
-        private uint _poll_id = 0;
         private DBusConnection? _conn = null;
         private uint _props_sub_id = 0;
+        private uint _names_sub_id = 0;
         private bool _poll_running = false;
         private bool _poll_again = false;
 
         public Extension() {
             setup.begin();
-            _poll_id = GLib.Timeout.add(2000, () => {
-                request_poll();
-                return GLib.Source.CONTINUE;
-            });
         }
 
         private async void setup() {
@@ -47,13 +43,20 @@ namespace MprisDock {
                     (conn, sender, path, iface, sig, args) => {
                         request_poll();
                     });
+                _names_sub_id = _conn.signal_subscribe(
+                    "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                    "/org/freedesktop/DBus", "org.mpris.MediaPlayer2",
+                    DBusSignalFlags.MATCH_ARG0_NAMESPACE,
+                    (conn, sender, path, iface, sig, args) => {
+                        request_poll();
+                    });
                 request_poll();
             } catch (Error e) {}
         }
 
         ~Extension() {
-            if (_poll_id != 0) GLib.Source.remove(_poll_id);
             if (_conn != null && _props_sub_id != 0) _conn.signal_unsubscribe(_props_sub_id);
+            if (_conn != null && _names_sub_id != 0) _conn.signal_unsubscribe(_names_sub_id);
         }
 
         // ── DockItemExtension ────────────────────────────────────────────────

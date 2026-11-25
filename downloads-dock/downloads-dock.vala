@@ -42,12 +42,18 @@ namespace DownloadsDock {
                 warning("downloads-dock: monitor failed: %s", e.message);
             }
             rescan();
-            // Poll to update sizes (file monitor only fires on create/delete/rename,
-            // not on continuous writes during a download).
-            _poll_id = GLib.Timeout.add_seconds(1, () => {
-                update_sizes();
-                return GLib.Source.CONTINUE;
-            });
+        }
+
+        private void sync_size_poll() {
+            if (_active.size > 0 && _poll_id == 0) {
+                _poll_id = GLib.Timeout.add_seconds(1, () => {
+                    update_sizes();
+                    return GLib.Source.CONTINUE;
+                });
+            } else if (_active.size == 0 && _poll_id != 0) {
+                GLib.Source.remove(_poll_id);
+                _poll_id = 0;
+            }
         }
 
         ~Extension() {
@@ -89,6 +95,7 @@ namespace DownloadsDock {
             } catch (Error e) {
                 // Probably the dir doesn't exist or is unreadable - leave _active as-is.
             }
+            sync_size_poll();
             this.changed("");
         }
 
