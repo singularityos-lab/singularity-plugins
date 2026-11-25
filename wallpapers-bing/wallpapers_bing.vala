@@ -35,7 +35,7 @@ namespace WallpapersBing {
         }
         public bool requires_credentials { get { return false; } }
         public bool supports_search { get { return false; } }
-        public Provider() { base("singularity-wallpaper-bing"); }
+        public Provider() { base("singularity-binghelper"); }
         public void start_prefetch() {
             cancel_all = new Cancellable();
             if (network_handler == 0)
@@ -131,7 +131,7 @@ public class WallpapersBingPlugin : Object, Singularity.Plugin {
 
     public Gtk.Widget? get_settings_widget() {
         var box = new Box(Orientation.VERTICAL, 8);
-        var lbl = new Label(_("Adds Bing's daily wallpaper images to the wallpaper browser. Requires the singularity-wallpaper-bing helper."));
+        var lbl = new Label(_("Adds Bing's daily wallpaper images to the wallpaper browser."));
         lbl.wrap = true;
         lbl.xalign = 0;
         box.append(lbl);
